@@ -27,6 +27,67 @@ DSH 的 web API（`/api/*`）是给浏览器用的：一次 `session.history` �
 
 ## 安装
 
+**前置条件**
+
+- 能跑 `dsh web` 的 DSH（本文在 DSH `0.1.1-rc.2` 上验证）
+- Node.js **18+**（插件用了全局 `fetch` 与 `AbortSignal.timeout`）
+- 笔和 PC 在**同一个局域网**
+
+`dsh plugin --profile web ...` 内部就是 pnpm，所以下面三种写法都行。
+
+### 方式 1：clone 源码（推荐，改起来方便）
+
+```bash
+# macOS / Linux
+git clone https://github.com/panderQWQ/pen-dsh-gateway.git ~/pen-dsh-gateway
+dsh plugin --profile web add link:$HOME/pen-dsh-gateway
+
+# Windows (PowerShell)
+git clone https://github.com/panderQWQ/pen-dsh-gateway.git $HOME\pen-dsh-gateway
+dsh plugin --profile web add link:$HOME\pen-dsh-gateway
+```
+
+### 方式 2：让 dsh 直接拉 git 仓库
+
+```bash
+dsh plugin --profile web add github:panderQWQ/pen-dsh-gateway
+```
+
+### 方式 3：tarball
+
+```bash
+dsh plugin --profile web add https://github.com/panderQWQ/pen-dsh-gateway/archive/refs/heads/main.tar.gz
+```
+
+> 三种方式装完都要 **重启一次 `dsh web`**：插件是在启动时注册路由的。
+
+### 装完确认
+
+```bash
+curl -s http://127.0.0.1:3080/api/pen/health
+# {"ok":true,"plugin":"pen-gateway","version":"0.1.0"}
+```
+
+### 让笔连得上（网络与防火墙）
+
+- DSH web 默认监听 `0.0.0.0:3080`；笔端填的地址是 **PC 的局域网 IP : 3080**，例如 `192.168.1.119:3080`
+- **Windows**：首次启动会弹防火墙窗，勾选「专用网络」；或在「高级安全 Windows Defender 防火墙 → 入站规则」放行 TCP 3080
+- **macOS**：系统设置 → 网络 → 防火墙 → 选项 → 允许 Node 接受传入连接
+- **Linux**：`sudo ufw allow 3080/tcp`（或 `firewall-cmd --add-port=3080/tcp`）
+- 插件自带信任边界：只接受 loopback 与**本机网卡地址**；如果你用了端口转发/反向代理，把外部 Host 加进 `trustedHosts`
+
+### 平台适配
+
+插件是**纯 JS（ESM）、零原生依赖**，跑在 DSH 自己的 Node 进程里，因此 **Windows / macOS / Linux（x64、arm64 均可）** 都一样。
+
+| 项 | 说明 |
+|---|---|
+| 依赖 | 只有 `@deepseek-ai/schemastery`（DSH 自带）+ `node:os`；网络用全局 `fetch` |
+| 平台差异 | 只有三处：`link:` 路径写法、系统防火墙、DSH 版本（需要 web profile） |
+| 笔端要求 | 能发 HTTP GET 的小程序运行时即可（本项目笔端是「笔上DSH」） |
+| 未适配 | 非 Node 环境（如纯浏览器/Deno）没测；需要 `ctx.webServer.register` 这个宿主能力 |
+
+
 ```bash
 git clone https://github.com/panderQWQ/pen-dsh-gateway.git
 dsh plugin --profile web add link:$PWD/pen-dsh-gateway
