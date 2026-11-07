@@ -1,0 +1,6 @@
+# pen-gateway —— bundle 自带挂载声明（与 whale_craft 同款模式）
+# profile 的 dsh.profile.bundles 里列出本包名即生效。
+- insert:
+    - id: pen-gateway
+      name: pen-gateway
+      config: {}
