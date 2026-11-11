@@ -2,7 +2,7 @@
 
 把 **有道词典笔** 接到 **DeepSeek Harness (DSH)** 上的桥接插件。
 
-DSH 的 web API（`/api/*`）是给浏览器用的：一次 `session.history` 返回的事件流动辄几百 KB，
+DSH 的 web API（`/api/*`）是给浏览器用的：一次会话历史读返回的事件流动辄几百 KB，
 小屏设备（词典笔、手表、ESP32 之类）既解析不动也显示不下。本插件在宿主里注册一组
 `/api/pen/*` 轻量接口，**在服务端把事件流折叠成一条条「角色 + 纯文本」消息**，
 笔端拿到的是可以直接往屏幕上画的数据。
@@ -13,12 +13,16 @@ DSH 的 web API（`/api/*`）是给浏览器用的：一次 `session.history` �
 
 ## 特性
 
-- **折叠会话**：`session.history` 的 `assistant/chunk`、`reasoning`、`tool` 事件全部丢掉，
+- **进程内 RPC，自动适配版本**：DSH 0.1.7+ 直接调用宿主进程内的 `typertGateway`
+  （绕开新版 `/api` 的浏览器鉴权栅栏，非浏览器的 HTTP 回环 RPC 会被 401 拒绝）；
+  DSH ≤0.1.1 自动回退 HTTP loopback（老的 `session.history` API）。
+  首次调用探测一次通道，之后记住
+- **折叠会话**：`assistant/chunk`、`reasoning`、`tool` 事件全部丢掉，
   只保留 `user/message` 与 `assistant/message` 的文本块
 - **长度截断**：单条消息默认截到 6000 字符（可配），避免糊满小屏
 - **标题/上下文百分比**：标题取 `projections.values.title`；
   上下文占用取 `projections.values.contextPressure`，换算成 `pct`
-- **归档过滤**：`workspace.list` 里 `archivedSessionIds` 中的会话不出现在列表里
+- **归档过滤**：仅 DSH ≤0.1.1（0.1.7 起没有 `workspace.list` 了，归档会话可能出现在列表里，不影响使用）
 - **长轮询**：`/watch` 挂起最多 25 秒，会话一有动静立刻返回（近似「服务器主动推送」）
 - **纯路径式缓存接口**：`/s/<id>`、`/h/<hex>`。
   有些嵌入式运行时（如有道词典笔的 falcon）**用 `downloadFile` 下载时会丢掉 URL 的 query**，
@@ -29,7 +33,7 @@ DSH 的 web API（`/api/*`）是给浏览器用的：一次 `session.history` �
 
 **前置条件**
 
-- 能跑 `dsh web` 的 DSH（本文在 DSH `0.1.1-rc.2` 上验证）
+- 能跑 `dsh web` 的 DSH（本文在 DSH `0.1.7-rc.2` 上验证，向后兼容到 `0.1.1-rc.2`）
 - Node.js **18+**（插件用了全局 `fetch` 与 `AbortSignal.timeout`）
 - 笔和 PC 在**同一个局域网**
 
@@ -65,7 +69,7 @@ dsh plugin --profile web add https://github.com/panderQWQ/pen-dsh-gateway/archiv
 
 ```bash
 curl -s http://127.0.0.1:3080/api/pen/health
-# {"ok":true,"plugin":"pen-gateway","version":"0.1.0"}
+# {"ok":true,"plugin":"pen-gateway","version":"1.1.0"}
 ```
 
 ### 让笔连得上（网络与防火墙）
@@ -122,7 +126,7 @@ curl -s http://127.0.0.1:3080/api/pen/sessions | head -c 300
 
 返回体一律 `{ok:true, ...}` / `{ok:false, error:"..."}`，HTTP 状态码保持 200，方便嵌入式端解析。
 
-`session.history` 的原始事件 → 折叠后：
+原始事件 → 折叠后：
 
 ```json
 { "role": "user",      "text": "把渲染换成画布", "seq": 41 }
@@ -135,7 +139,7 @@ curl -s http://127.0.0.1:3080/api/pen/sessions | head -c 300
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `port` | `3080` | DSH web 端口（loopback RPC 也用它） |
+| `port` | `3080` | DSH web 端口（仅旧版 HTTP 回退通道用） |
 | `trustedHosts` | `[]` | 额外放行的 Host，形如 `192.168.8.7:3080` |
 | `newSessionCwd` | `''` | `/new` 新建会话的工作目录 |
 | `maxMsgChars` | `6000` | 单条消息最大字符数 |
@@ -143,15 +147,21 @@ curl -s http://127.0.0.1:3080/api/pen/sessions | head -c 300
 ## 工作原理
 
 ```
-笔端小程序 ──HTTP(JSON)──▶ pen-gateway(本插件) ──loopback POST /api/<method>──▶ DSH web 内核
+笔端小程序 ──HTTP(JSON)──▶ pen-gateway(本插件) ──▶ DSH web 内核
                               │
-                              └─ session.list / session.history / session.prompt …
+                              └─ DSH 0.1.7+：进程内 typertGateway.invoke（不经 HTTP，不受鉴权栅栏限制）
+                                   session/list / session/page / session/projections / session/prompt …
+                                 DSH ≤0.1.1：HTTP loopback POST /api/<method>（老方法名 + 老信封）
                                  折叠事件流、算标题与上下文百分比
 ```
 
-宿主 RPC 走 loopback：`POST http://127.0.0.1:<port>/api/<method>`，
-信封 `{type:'client-request', rpcId, method, payload}`，回包
-`{type:'server-response', rpcId, result:{ok:true,value}|{ok:false,error}}`。
+新版宿主的 `/api/*` 有浏览器鉴权栅栏：非浏览器的 HTTP 回环 RPC 一律 401，插件因此改为
+进程内直调宿主的 `typertGateway` 服务（`invoke({namespace:'session', method, args})`，
+args 按 wire 字段精确匹配：多数方法是 `{request:{…}}`，`session/list` 是 `{_request:{…}}`，
+`session/modelCatalog` 是 `{}`）。历史读用 `session.page`：尾部 seq 先从
+`session.projections` 的 `asOfSeq` 取（它是日志最后一条事件的 seq；`throughSeq:-1` 是空页不是「最新」），
+向上翻页传 `beforeSeq`。老版 DSH 没有这些 API，插件首启探测一次
+（`session/modelCatalog` 只有新版有），失败就走老的 HTTP loopback + `session.history`。
 
 ## License
 

@@ -2,7 +2,7 @@
  * pen-gateway —— 点读笔 DSH 网关（host 端插件）
  * ============================================================================
  * 问题：笔端（QuickJS/falcon）只有朴素的 request/response HTTP，拉不动 DSH 的
- * 原始事件流（一次 session.history 尾部就是几百 KB 的 assistant/chunk）。
+ * 原始事件流（一次尾部读就是几百 KB 的 assistant/chunk）。
  *
  * 方案：本插件挂载 /api/pen/* 前缀路由（webServer 最长前缀优先，赢过宿主 /api），
  * 在 PC 侧完成 重 RPC + 事件折叠，只给笔端发几 KB 的紧凑 JSON：
@@ -14,8 +14,13 @@
  *   POST /api/pen/cancel {sessionId}      → {ok}
  *   POST /api/pen/new {cwd?}              → {ok, sessionId} （建新会话）
  *
- * 内部全部走 loopback 复用宿主 /api RPC（信封 {type:'client-request',...}），
- * 不直接依赖 host 内部服务 API，宿主升级不易被牵连。
+ * 传输层（v1.1.0 起）：
+ *   - DSH 0.1.7+：宿主 /api 加了浏览器鉴权栅栏（非浏览器 HTTP 回环 RPC 一律 401），
+ *     改走进程内 typertGateway.invoke({namespace:'session',...})，不经 HTTP、不受栅栏影响；
+ *   - DSH ≤0.1.1：自动回退旧的 HTTP loopback（session.history 等老方法名 + 老信封）。
+ *   首次调用探测一次（session/modelCatalog 只有新版有），之后记住通道，探测失败 60s 后重试。
+ *
+ * 响应形状与 v0.1.0 完全一致，笔端 app（笔上DSH v1.1.x）无需任何改动。
  *
  * 信任栅栏：与 whale_craft / dsh-serve 同款（DNS-rebinding + 跨站），
  * loopback 恒放行；本机局域网 IP 自动放行（笔就在局域网），另可配 trustedHosts。
@@ -27,10 +32,10 @@ import { networkInterfaces } from 'node:os'
 export const name = 'pen-gateway'
 export const inject = ['webServer']
 
-const PLUGIN_VERSION = '0.1.0'
+const PLUGIN_VERSION = '1.1.0'
 
 export const Config = z.object({
-  /** loopback RPC 目标端口（宿主 webserver） */
+  /** 旧版 HTTP 回退通道的目标端口（宿主 webserver） */
   port: z.natural().default(3080),
   /** 额外放行的 Host 权威（如 '192.168.8.7:3080'）；本机 IP 自动放行 */
   trustedHosts: z.array(z.string()).default([]),
@@ -85,7 +90,12 @@ function readJsonBody(req) {
 
 /* ============================ 折叠：事件流 → 紧凑消息 ============================ */
 
-/** 从 pi-ai message.content 里抽纯文本块 */
+function clip(s, max) {
+  if (typeof s !== 'string') return ''
+  return s.length <= max ? s : s.slice(0, max) + '…'
+}
+
+/** 从 message.content 里抽纯文本块（跳过 reasoning/tool-call；与 UI 的抽法一致） */
 function textOfContent(content) {
   if (typeof content === 'string') return content
   if (!Array.isArray(content)) return ''
@@ -96,15 +106,23 @@ function textOfContent(content) {
   return parts.join('\n').trim()
 }
 
-function clip(s, max) {
-  if (typeof s !== 'string') return ''
-  return s.length <= max ? s : s.slice(0, max) + '…'
+/**
+ * 事件 → 消息本体。0.1.x 两种形状：
+ *   user/message      data 就是消息本体 {id, role, source, content:[...]}
+ *   assistant/message data = {turn, step, stream, message:{id, role, source, content:[...]}}
+ * 老版 DSH 的 history 事件也兼容（data.message ?? data 同样成立）。
+ */
+function messageOfEvent(ev) {
+  const d = ev?.data
+  if (!d || typeof d !== 'object') return undefined
+  const m = d.message ?? d
+  return (m && typeof m === 'object' && Array.isArray(m.content)) ? m : undefined
 }
 
 /**
- * 把 session.history 事件折成 [{role, text, seq}]。
+ * 把一页事件折成 [{role, text, seq}]。
  * 只保留 user/message 与 assistant/message 的文本块（跳过 reasoning/tool/chunk）。
- * events 按返回顺序（seq 升序）。
+ * events 按 seq 升序。
  */
 function foldEvents(events, maxMsgChars) {
   const out = []
@@ -112,9 +130,9 @@ function foldEvents(events, maxMsgChars) {
     const ev = entry?.event ?? entry
     if (!ev || typeof ev.type !== 'string') continue
     if (ev.type !== 'user/message' && ev.type !== 'assistant/message') continue
-    const d = ev.data ?? {}
-    const msg = d.message ?? d
-    const text = textOfContent(msg.content ?? msg.text)
+    const msg = messageOfEvent(ev)
+    if (!msg) continue
+    const text = textOfContent(msg.content)
     if (!text) continue
     out.push({ role: ev.type === 'user/message' ? 'user' : 'assistant', text: clip(text, maxMsgChars), seq: ev.seq ?? 0 })
   }
@@ -138,9 +156,47 @@ export function apply(ctx, config) {
   }
   const liveTrusted = () => [...trusted]
 
-  /* ---- loopback RPC 复用宿主 /api ---- */
+  /* ============================ RPC 层 ============================
+   * 新宿主（0.1.7+）：进程内 typertGateway.invoke，args 按 wire 字段精确匹配：
+   *   大多数方法  { request: {...} }
+   *   session/list { _request: {...} }
+   *   session/modelCatalog {}
+   * 老宿主（≤0.1.1）：HTTP loopback，老方法名 + 老信封。
+   * 通道探测：modelCatalog 只有新版有；探测结果缓存，false 60s 后重试。 */
+
+  function safeGet(key) {
+    try { return ctx.get(key) } catch { return undefined }
+  }
+
+  function errText(e) {
+    if (e && typeof e === 'object') {
+      const code = typeof e.code === 'string' ? e.code : ''
+      const msg = typeof e.message === 'string' ? e.message : String(e)
+      return code ? `${code}: ${msg}` : msg
+    }
+    return String(e)
+  }
+
   let rpcSeq = 0
-  async function rpc(method, payload) {
+  let probeState = { v: null, at: 0 }
+
+  async function gw(method, args) {
+    const service = safeGet('typertGateway')
+    if (!service || typeof service.invoke !== 'function') {
+      throw new Error('gateway/unavailable: typertGateway 服务不存在')
+    }
+    return await service.invoke({ namespace: 'session', method, args })
+  }
+
+  async function callNew(method, args) {
+    try {
+      return await gw(method, args)
+    } catch (e) {
+      throw new Error(errText(e))
+    }
+  }
+
+  async function httpOld(method, payload) {
     const body = JSON.stringify({
       type: 'client-request',
       rpcId: 'pen' + Date.now().toString(36) + (rpcSeq++).toString(36),
@@ -153,7 +209,11 @@ export function apply(ctx, config) {
       body,
       signal: AbortSignal.timeout(30_000),
     })
-    const env = await r.json()
+    const raw = await r.text()
+    let env
+    try { env = JSON.parse(raw) } catch {
+      throw new Error(`dsh ${r.status}: ${raw.slice(0, 80) || '空响应'}（HTTP RPC 被宿主拒绝）`)
+    }
     const result = env?.result
     if (!result?.ok) {
       const err = result?.error ?? { code: 'rpc-failed', message: `HTTP ${r.status}` }
@@ -162,21 +222,47 @@ export function apply(ctx, config) {
     return result.value
   }
 
-  let listCache = { at: 0, v: null, wv: null }
+  async function rpcMode() {
+    if (probeState.v === true) return true
+    if (probeState.v === false && Date.now() - probeState.at < 60_000) return false
+    const service = safeGet('typertGateway')
+    let ok = false
+    if (service && typeof service.invoke === 'function') {
+      try {
+        await service.invoke({ namespace: 'session', method: 'modelCatalog', args: {} })
+        ok = true
+      } catch { ok = false }
+    }
+    probeState = { v: ok, at: Date.now() }
+    ctx.logger?.info?.(`[pen-gateway] RPC 通道：${ok ? '进程内 typertGateway（DSH 0.1.7+）' : 'HTTP loopback（旧版 DSH）'}`)
+    return ok
+  }
+
+  /* ============================ 会话列表 ============================ */
+
+  let listCache = { at: 0, items: null }
   async function listSessions(force) {
     const now = Date.now()
-    if (!force && listCache.v && now - listCache.at < 900) return listCache.items
-    const [v, wv] = await Promise.all([
-      rpc('session.list', {}),
-      rpc('workspace.list', {}).catch(() => null),
-    ])
-    listCache = { at: now, v, wv }
-    const archived = new Set(wv?.archivedSessionIds ?? [])
-    listCache.items = (v?.items ?? [])
-      .filter((it) => !it.origin)                     // 子代理不进列表
-      .filter((it) => !archived.has(it.sessionId))    // 归档（已隐藏）的不进列表
-      .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
-    return listCache.items
+    if (!force && listCache.items && now - listCache.at < 900) return listCache.items
+    let items
+    if (await rpcMode()) {
+      const v = await callNew('list', { _request: {} })
+      /* 0.1.7 起没有 workspace.list 了，拿不到归档名单：只过滤子代理，
+         归档会话偶尔会出现在列表里（不影响使用） */
+      items = (v?.items ?? []).filter((it) => !it.origin)
+    } else {
+      const [v, wv] = await Promise.all([
+        httpOld('session.list', {}),
+        httpOld('workspace.list', {}).catch(() => null),
+      ])
+      const archived = new Set(wv?.archivedSessionIds ?? [])
+      items = (v?.items ?? [])
+        .filter((it) => !it.origin)
+        .filter((it) => !archived.has(it.sessionId))
+    }
+    items.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
+    listCache = { at: now, items }
+    return items
   }
 
   function titleOf(it) {
@@ -187,106 +273,186 @@ export function apply(ctx, config) {
     return base + preset
   }
 
-  /** 完整对话快照（笔端缓存用）：尽量把整段历史折出来，最多 maxN 条 */
-  async function snapshot(sessionId, maxN) {
-    const want = Math.min(Math.max(maxN ?? 200, 1), 400)
-    const listP = rpc('session.list', {}).catch(() => null)
+  /* ============================ 分页读 ============================
+   * 新版 session.page 不认 throughSeq:-1（那是空页），尾部 seq 要先从
+   * session.projections 的 asOfSeq 拿（= 日志最后一条事件的 seq）。
+   * 老版 session.history 自带头部读，不需要游标。 */
+
+  async function cursorOf(sessionId) {
+    if (!(await rpcMode())) return null
+    const v = await callNew('projections', { request: { sessionId } })
+    if (!v || typeof v.asOfSeq !== 'number') throw new Error('session/not-found: projections 为空')
+    return v.asOfSeq
+  }
+
+  /** 读一页：返回 {events:[{type,seq,time,data}], hasMore}（事件已解包、统一形状） */
+  async function pageOnce(sessionId, cursor, beforeSeq, maxMessages) {
+    if (await rpcMode()) {
+      const req = { address: { kind: 'session', sessionId }, throughSeq: cursor, maxMessages }
+      if (beforeSeq !== undefined) req.beforeSeq = beforeSeq
+      const v = await callNew('page', { request: req })
+      return {
+        events: (v?.records ?? []).map((r) => r?.event).filter(Boolean),
+        hasMore: !!v?.hasMore,
+      }
+    }
+    const payload = { sessionId, maxMessages }
+    if (beforeSeq !== undefined) payload.beforeSeq = beforeSeq
+    const v = await httpOld('session.history', payload)
+    return {
+      events: (v?.events ?? []).map((e) => e?.event ?? e).filter(Boolean),
+      hasMore: !!v?.hasMore,
+    }
+  }
+
+  /** 从尾部往下翻，折出最多 want 条；wantMeta 时顺带取 running/title/上下文水位 */
+  async function foldHistory(sessionId, want, { maxPages = 24, wantMeta = false } = {}) {
+    const cap = Math.min(Math.max(want, 1), 400)
+    const cursor = await cursorOf(sessionId)
+    const listP = wantMeta ? listSessions().catch(() => null) : Promise.resolve(null)
     const messages = []
     const seen = new Set()
     let beforeSeq
-    for (let page = 0; page < 24; page++) {
-      const payload = { sessionId, maxMessages: 24 }
-      if (beforeSeq !== undefined) payload.beforeSeq = beforeSeq
-      let v
-      try { v = await rpc('session.history', payload) } catch { break }
-      const evs = v?.events ?? []
-      if (!evs.length) break
-      const folded = foldEvents(evs, maxMsgChars)
+    let hasMore = false
+    for (let page = 0; page < maxPages; page++) {
+      const got = await pageOnce(sessionId, cursor, beforeSeq, 24)
+      hasMore = got.hasMore
+      if (!got.events.length) break
       const batch = []
-      for (const m of folded) {
+      for (const m of foldEvents(got.events, maxMsgChars)) {
         const key = m.seq + '|' + m.role
         if (seen.has(key)) continue
         seen.add(key)
         batch.push(m)
       }
       messages.unshift(...batch)
-      beforeSeq = Math.min(...evs.map((e) => (e.event ?? e).seq ?? 0))
-      if (messages.length >= want || !v?.hasMore) break
+      beforeSeq = Math.min(...got.events.map((e) => e.seq ?? 0))
+      if (messages.length >= cap || !hasMore) break
     }
-    const listV = await listP
-    const me = (listV?.items ?? []).find((it) => it.sessionId === sessionId)
+    const me = (await listP ?? []).find((it) => it.sessionId === sessionId)
     const cp = me?.projections?.values?.contextPressure
-    let ctx = null
+    let ctxInfo = null
     if (cp && typeof cp.contextWindow === 'number' && cp.contextWindow > 0) {
-      const used = typeof cp.projectedTokens === 'number' ? cp.projectedTokens : (cp.pressureTokens ?? 0)
-      ctx = { pct: Math.max(0, Math.min(100, Math.round((used / cp.contextWindow) * 100))), used, total: cp.contextWindow }
-    }
-    const trimmed = messages.slice(-want)
-    return {
-      running: !!me?.running, title: me ? titleOf(me) : '', ctx,
-      messages: trimmed, count: trimmed.length,
-      savedAt: Date.now(),
-    }
-  }
-
-  /** seq 之前的若干条（往上翻） */
-  async function before(sessionId, beforeSeq, n) {
-    const want = Math.min(Math.max(n ?? 5, 1), 30)
-    const out = []
-    let cursor = beforeSeq
-    let hasMore = false
-    for (let page = 0; page < 6; page++) {
-      const v = await rpc('session.history', { sessionId, maxMessages: 24, beforeSeq: cursor })
-      const evs = v?.events ?? []
-      if (!evs.length) break
-      const folded = foldEvents(evs, maxMsgChars)
-      out.unshift(...folded)
-      cursor = Math.min(...evs.map((e) => (e.event ?? e).seq ?? 0))
-      hasMore = !!v?.hasMore
-      if (out.length >= want || !hasMore) break
-    }
-    return { messages: out.slice(-want), hasMore }
-  }
-
-  /** 尾部折叠消息；带 running 标志 */
-  async function tail(sessionId, n) {
-    const want = Math.min(Math.max(n ?? 6, 1), 400)
-    const listP = rpc('session.list', {}).catch(() => null)
-    const messages = []
-    let beforeSeq
-    for (let page = 0; page < 24; page++) {
-      const payload = { sessionId, maxMessages: 24 }
-      if (beforeSeq !== undefined) payload.beforeSeq = beforeSeq
-      const v = await rpc('session.history', payload)
-      const evs = v?.events ?? []
-      if (evs.length) {
-        const folded = foldEvents(evs, maxMsgChars)
-        messages.unshift(...folded)
-        beforeSeq = Math.min(...evs.map((e) => (e.event ?? e).seq ?? 0))
-      }
-      if (messages.length >= want || !v?.hasMore || !evs.length) break
-    }
-    const listV = await listP
-    const me = (listV?.items ?? []).find((it) => it.sessionId === sessionId)
-    const cp = me?.projections?.values?.contextPressure
-    let ctx = null
-    if (cp && typeof cp.contextWindow === 'number' && cp.contextWindow > 0) {
-      const used = typeof cp.projectedTokens === 'number' ? cp.projectedTokens : (cp.pressureTokens ?? 0)
-      ctx = {
+      const used = typeof cp.pressureTokens === 'number' ? cp.pressureTokens : 0
+      ctxInfo = {
         pct: Math.max(0, Math.min(100, Math.round((used / cp.contextWindow) * 100))),
         used, total: cp.contextWindow,
       }
     }
-    return { running: !!me?.running, title: me ? titleOf(me) : '', messages: messages.slice(-want), ctx }
+    const trimmed = messages.slice(-cap)
+    return { running: !!me?.running, title: me ? titleOf(me) : '', ctx: ctxInfo, messages: trimmed, count: trimmed.length, hasMore }
   }
 
-  /* ---- /api/pen 路由 ----
+  /** seq 之前的若干条（往上翻） */
+  async function foldBefore(sessionId, beforeSeq, want) {
+    const cap = Math.min(Math.max(want, 1), 30)
+    const cursor = await cursorOf(sessionId)
+    const out = []
+    let top = beforeSeq
+    let hasMore = false
+    for (let page = 0; page < 6; page++) {
+      const got = await pageOnce(sessionId, cursor, top, 24)
+      hasMore = got.hasMore
+      if (!got.events.length) break
+      out.unshift(...foldEvents(got.events, maxMsgChars))
+      top = Math.min(...got.events.map((e) => e.seq ?? 0))
+      if (out.length >= cap || !hasMore) break
+    }
+    return { messages: out.slice(-cap), hasMore }
+  }
+
+  /* ============================ 写操作 ============================ */
+
+  let promptSeq = 0
+  async function doPrompt(sessionId, text, mode) {
+    if (await rpcMode()) {
+      const v = await callNew('prompt', {
+        request: {
+          requestId: `pen-${Date.now().toString(36)}-${(promptSeq++).toString(36)}`,
+          sessionId,
+          mode,
+          content: [{ type: 'text', text }],
+          clientTimeZone: 'Asia/Shanghai',
+        },
+      })
+      return v?.accepted === true
+    }
+    const v = await httpOld('session.prompt', { sessionId, mode, content: [{ type: 'text', text }], clientTimeZone: 'Asia/Shanghai' })
+    return v?.accepted === true
+  }
+
+  async function doCancel(sessionId) {
+    if (await rpcMode()) {
+      await callNew('cancel', { request: { sessionId } })
+      return
+    }
+    await httpOld('session.cancel', { sessionId })
+  }
+
+  async function doSelectModel(sessionId, provider, model) {
+    if (await rpcMode()) {
+      const v = await callNew('selectModel', { request: { sessionId, provider, model } })
+      return v?.selected ?? null
+    }
+    const v = await httpOld('session.selectModel', { sessionId, provider, model })
+    return v?.selected ?? null
+  }
+
+  async function doCreate(cwd) {
+    const payload = {}
+    if (cwd) payload.cwd = cwd
+    if (await rpcMode()) {
+      const v = await callNew('create', { request: payload })
+      return v?.sessionId ?? ''
+    }
+    const v = await httpOld('session.create', payload)
+    return v?.sessionId ?? ''
+  }
+
+  async function modelsOf(sessionId) {
+    if (await rpcMode()) {
+      const v = await callNew('modelCatalog', {})
+      /* 新版目录是全局的：会话当前模型从 projections.values.modelSelection 补 */
+      const items = await listSessions().catch(() => null)
+      const me = (items ?? []).find((it) => it.sessionId === sessionId)
+      const sel = me?.projections?.values?.modelSelection
+      const cur = sel?.next ?? sel?.lastUsed ?? v?.default ?? {}
+      const rows = []
+      for (const g of v?.groups ?? []) {
+        for (const m of g.models ?? []) {
+          rows.push({
+            label: String(m.name ?? m.id),
+            group: String(g.name ?? g.id),
+            provider: g.id, model: m.id,
+            current: cur?.provider === g.id && cur?.model === m.id,
+          })
+        }
+      }
+      return { routable: (v?.routableProviders ?? []).length > 0, current: cur, models: rows }
+    }
+    const v = await httpOld('session.models', { sessionId })
+    const cur = v?.current ?? {}
+    const rows = []
+    for (const g of v?.groups ?? []) {
+      for (const m of g.models ?? []) {
+        rows.push({
+          label: String(m.name ?? m.id),
+          group: String(g.name ?? g.id),
+          provider: g.id, model: m.id,
+          current: cur.provider === g.id && cur.model === m.id,
+        })
+      }
+    }
+    return { routable: !!v?.routable, current: cur, models: rows }
+  }
+
+  /* ============================ /api/pen 路由 ============================
    * GET/POST 双支持：笔端原生 http 的 POST body 能力未验证，全走 GET + query；
    * 桌面侧调试可用 POST JSON。 */
   async function handle(req, res, path, q, body) {
     body = body ?? {}
     if (path === '/health') {
-      return sendJson(res, 200, { ok: true, plugin: 'pen-gateway', version: '0.1.0' })
+      return sendJson(res, 200, { ok: true, plugin: 'pen-gateway', version: PLUGIN_VERSION })
     }
     if (path === '/sessions') {
       const items = await listSessions()
@@ -306,7 +472,8 @@ export function apply(ctx, config) {
     if (mSess) {
       const sessionId = decodeURIComponent(mSess[1])
       try {
-        return sendJson(res, 200, { ok: true, ...(await snapshot(sessionId, 120)) })
+        const h = await foldHistory(sessionId, 120, { wantMeta: true })
+        return sendJson(res, 200, { ok: true, ...h, savedAt: Date.now() })
       } catch (e) {
         return sendJson(res, 200, { ok: false, error: String(e?.message ?? e) })
       }
@@ -327,7 +494,8 @@ export function apply(ctx, config) {
       if (!sessionId) return sendJson(res, 200, { ok: false, error: 'sessionId required' })
       const n = parseInt(q.get('n') ?? body.n ?? '200', 10) || 200
       try {
-        return sendJson(res, 200, { ok: true, ...(await snapshot(sessionId, n)) })
+        const h = await foldHistory(sessionId, n, { wantMeta: true })
+        return sendJson(res, 200, { ok: true, ...h, savedAt: Date.now() })
       } catch (e) {
         return sendJson(res, 200, { ok: false, error: String(e?.message ?? e) })
       }
@@ -349,7 +517,7 @@ export function apply(ctx, config) {
       const n = Math.min(Math.max(parseInt(q.get('n') ?? body.n ?? '5', 10) || 5, 1), 30)
       if (!sessionId || !Number.isFinite(seq)) return sendJson(res, 200, { ok: false, error: 'sessionId/seq required' })
       try {
-        const got = await before(sessionId, seq, n)
+        const got = await foldBefore(sessionId, seq, n)
         return sendJson(res, 200, { ok: true, messages: got.messages, count: got.messages.length, hasMore: got.hasMore })
       } catch (e) {
         return sendJson(res, 200, { ok: false, error: String(e?.message ?? e) })
@@ -373,7 +541,7 @@ export function apply(ctx, config) {
         await new Promise((r) => setTimeout(r, 400))
       }
       try {
-        const t = await tail(sessionId, 6)
+        const t = await foldHistory(sessionId, 6, { wantMeta: true })
         const items2 = await listSessions()
         const me2 = items2.find((it) => it.sessionId === sessionId)
         return sendJson(res, 200, { ok: true, changed, updatedAt: me2?.updatedAt ?? 0, ...t, waitedMs: Date.now() - t0 })
@@ -385,43 +553,26 @@ export function apply(ctx, config) {
       const sessionId = String(q.get('sessionId') ?? body.sessionId ?? '')
       if (!sessionId) return sendJson(res, 200, { ok: false, error: 'sessionId required' })
       const n = parseInt(q.get('n') ?? body.n ?? '6', 10) || 6
-      return sendJson(res, 200, { ok: true, ...(await tail(sessionId, n)) })
+      return sendJson(res, 200, { ok: true, ...(await foldHistory(sessionId, n, { wantMeta: true })) })
     }
     if (path === '/prompt') {
       const sessionId = String(q.get('sessionId') ?? body.sessionId ?? '')
       const text = String(q.get('text') ?? body.text ?? '').trim()
       const mode = (q.get('mode') ?? body.mode) === 'steer' ? 'steer' : 'queue'
       if (!sessionId || !text) return sendJson(res, 200, { ok: false, error: 'sessionId/text required' })
-      const v = await rpc('session.prompt', {
-        sessionId, mode,
-        content: [{ type: 'text', text }],
-        clientTimeZone: 'Asia/Shanghai',
-      })
-      return sendJson(res, 200, { ok: true, accepted: v?.accepted === true })
+      const accepted = await doPrompt(sessionId, text, mode)
+      return sendJson(res, 200, { ok: true, accepted })
     }
     if (path === '/cancel') {
       const sessionId = String(q.get('sessionId') ?? body.sessionId ?? '')
       if (!sessionId) return sendJson(res, 200, { ok: false, error: 'sessionId required' })
-      await rpc('session.cancel', { sessionId })
+      await doCancel(sessionId)
       return sendJson(res, 200, { ok: true })
     }
     if (path === '/models') {
       const sessionId = String(q.get('sessionId') ?? body.sessionId ?? '')
       if (!sessionId) return sendJson(res, 200, { ok: false, error: 'sessionId required' })
-      const v = await rpc('session.models', { sessionId })
-      const cur = v?.current ?? {}
-      const rows = []
-      for (const g of v?.groups ?? []) {
-        for (const m of g.models ?? []) {
-          rows.push({
-            label: String(m.name ?? m.id),
-            group: String(g.name ?? g.id),
-            provider: g.id, model: m.id,
-            current: cur.provider === g.id && cur.model === m.id,
-          })
-        }
-      }
-      return sendJson(res, 200, { ok: true, routable: !!v?.routable, current: cur, models: rows })
+      return sendJson(res, 200, { ok: true, ...(await modelsOf(sessionId)) })
     }
     if (path === '/setmodel') {
       const sessionId = String(q.get('sessionId') ?? body.sessionId ?? '')
@@ -430,15 +581,13 @@ export function apply(ctx, config) {
       if (!sessionId || !provider || !model) {
         return sendJson(res, 200, { ok: false, error: 'sessionId/provider/model required' })
       }
-      const v = await rpc('session.selectModel', { sessionId, provider, model })
-      return sendJson(res, 200, { ok: true, selected: v?.selected ?? null })
+      const selected = await doSelectModel(sessionId, provider, model)
+      return sendJson(res, 200, { ok: true, selected })
     }
     if (path === '/new') {
-      const payload = {}
       const cwd = String(q.get('cwd') ?? body.cwd ?? config.newSessionCwd ?? '').trim()
-      if (cwd) payload.cwd = cwd
-      const v = await rpc('session.create', payload)
-      return sendJson(res, 200, { ok: true, sessionId: v?.sessionId ?? '' })
+      const sessionId = await doCreate(cwd)
+      return sendJson(res, 200, { ok: true, sessionId })
     }
     return sendJson(res, 200, { ok: false, error: `unknown endpoint ${path}` })
   }
@@ -468,7 +617,7 @@ export function apply(ctx, config) {
     },
   }
   ctx.effect(() => ctx.webServer.register(route), 'pen-gateway: /api/pen 路由')
-  ctx.logger?.info?.('[pen-gateway] /api/pen/* 已挂载（点读笔网关 v0.1.0）')
+  ctx.logger?.info?.(`[pen-gateway] /api/pen/* 已挂载（点读笔网关 v${PLUGIN_VERSION}）`)
 }
 
 export default { name, inject, Config, apply }
