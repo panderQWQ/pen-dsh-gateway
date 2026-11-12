@@ -24,6 +24,10 @@ DSH 的 web API（`/api/*`）是给浏览器用的：一次会话历史读返回
   上下文占用取 `projections.values.contextPressure`，换算成 `pct`
 - **归档过滤**：仅 DSH ≤0.1.1（0.1.7 起没有 `workspace.list` 了，归档会话可能出现在列表里，不影响使用）
 - **长轮询**：`/watch` 挂起最多 25 秒，会话一有动静立刻返回（近似「服务器主动推送」）
+- **运行时审批**：DSH 的 `approval/request` 是瀑布事件，浏览器桥在没开网页时会把请求挂死。
+  插件用 `prepend` 抢在最前：笔端在线（20s 内有请求）就把审批挂起推给笔端弹窗，
+  1.5s 后照旧转给浏览器 UI——两边谁先答都算数。笔端没在用则完全不插手
+- **权限管理**：`/perm` 读取/切换 DSH 权限预设（审批策略 + 沙箱档位），走宿主的 `permissionPresets` 服务
 - **纯路径式缓存接口**：`/s/<id>`、`/h/<hex>`。
   有些嵌入式运行时（如有道词典笔的 falcon）**用 `downloadFile` 下载时会丢掉 URL 的 query**，
   所以缓存类接口必须无 query，插件为此专门提供了路径式版本
@@ -69,7 +73,7 @@ dsh plugin --profile web add https://github.com/panderQWQ/pen-dsh-gateway/archiv
 
 ```bash
 curl -s http://127.0.0.1:3080/api/pen/health
-# {"ok":true,"plugin":"pen-gateway","version":"1.1.0"}
+# {"ok":true,"plugin":"pen-gateway","version":"1.2.0"}
 ```
 
 ### 让笔连得上（网络与防火墙）
@@ -122,6 +126,10 @@ curl -s http://127.0.0.1:3080/api/pen/sessions | head -c 300
 | GET/POST | `/api/pen/models?sessionId=` | 模型列表（含 `current`） |
 | GET/POST | `/api/pen/setmodel?sessionId=&provider=&model=` | 切换模型 |
 | GET/POST | `/api/pen/cancel?sessionId=` | 停止当前轮 |
+| GET/POST | `/api/pen/approvals?sessionId=` | 待审批的外部权限请求 |
+| GET/POST | `/api/pen/approve?id=&allow=` | 批准/拒绝（`allow=0` 为拒绝） |
+| GET/POST | `/api/pen/perm?sessionId=` | 权限预设目录 + 当前值 |
+| GET/POST | `/api/pen/perm?sessionId=&preset=` | 切换权限预设 |
 | GET/POST | `/api/pen/cfg?text=` | 回显文本（query 版，桌面调试用） |
 
 返回体一律 `{ok:true, ...}` / `{ok:false, error:"..."}`，HTTP 状态码保持 200，方便嵌入式端解析。
@@ -143,6 +151,7 @@ curl -s http://127.0.0.1:3080/api/pen/sessions | head -c 300
 | `trustedHosts` | `[]` | 额外放行的 Host，形如 `192.168.8.7:3080` |
 | `newSessionCwd` | `''` | `/new` 新建会话的工作目录 |
 | `maxMsgChars` | `6000` | 单条消息最大字符数 |
+| `approvals` | `true` | 笔端在线时把 DSH 审批请求转给笔端弹窗 |
 
 ## 工作原理
 

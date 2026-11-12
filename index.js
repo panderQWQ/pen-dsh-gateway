@@ -13,6 +13,10 @@
  *   POST /api/pen/prompt {sessionId,text} → {ok, accepted}   （queue 模式入队）
  *   POST /api/pen/cancel {sessionId}      → {ok}
  *   POST /api/pen/new {cwd?}              → {ok, sessionId} （建新会话）
+ *   GET  /api/pen/approvals?sessionId=    → {approvals:[{id,toolName,reason,…}]}（待审批）
+ *   POST /api/pen/approve {id,allow}      → {ok, outcome}  （笔端批准/拒绝）
+ *   GET  /api/pen/perm?sessionId=         → {preset,presets:[…],approval,sandbox}
+ *   POST /api/pen/perm {sessionId,preset} → 切换权限预设
  *
  * 传输层（v1.1.0 起）：
  *   - DSH 0.1.7+：宿主 /api 加了浏览器鉴权栅栏（非浏览器 HTTP 回环 RPC 一律 401），
@@ -32,7 +36,7 @@ import { networkInterfaces } from 'node:os'
 export const name = 'pen-gateway'
 export const inject = ['webServer']
 
-const PLUGIN_VERSION = '1.1.0'
+const PLUGIN_VERSION = '1.2.0'
 
 export const Config = z.object({
   /** 旧版 HTTP 回退通道的目标端口（宿主 webserver） */
@@ -43,6 +47,8 @@ export const Config = z.object({
   newSessionCwd: z.string().default(''),
   /** 单条消息回给笔端的最大字符数 */
   maxMsgChars: z.natural().default(6000),
+  /** 笔端在线时把 DSH 的审批请求转给笔端弹窗（默认开） */
+  approvals: z.boolean().default(true),
 })
 
 /* ============================ 工具（照抄 whale_craft 同款栅栏） ============================ */
@@ -446,11 +452,141 @@ export function apply(ctx, config) {
     return { routable: !!v?.routable, current: cur, models: rows }
   }
 
+  /* ============================ 审批桥（运行时外部权限） ============================
+   * DSH 的 approval/request 是瀑布事件：宿主 ctx.waterfall(...)，监听者返回
+   * 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable' 之一，只有 allowed-once 放行。
+   * 浏览器桥（api-remotes）把请求塞进队列等浏览器拉取——浏览器没开就永远挂着。
+   * 这里 prepend 抢在最前：笔端在线时把请求挂起给笔端弹窗，同时 1.5s 后照旧转给
+   * 浏览器桥（两边谁先答都算数）；笔端没在用时完全不插手。 */
+
+  let approvalSeq = 0
+  const parked = new Map()          // id → { info, resolve }
+  let lastPenSeen = 0               // 笔端最近一次访问 /api/pen/* 的时间
+  const PEN_ACTIVE_MS = 20_000      // 静默这么久就认为笔端没在用
+  const APPROVALS_ENABLED = config.approvals !== false
+
+  function parkApproval(request) {
+    const id = 'pa' + (++approvalSeq)
+    const agent = request?.agent
+    const info = {
+      id,
+      toolName: String(request?.toolName ?? ''),
+      callId: request?.callId ? String(request.callId) : '',
+      reason: String(request?.reason ?? request?.displayReason ?? ''),
+      sessionId: String(agent?.session?.id ?? agent?.sessionId ?? ''),
+      at: Date.now(),
+    }
+    let resolve
+    const promise = new Promise((r) => { resolve = r })
+    parked.set(id, { info, resolve })
+    const signal = request?.signal
+    if (signal && typeof signal.addEventListener === 'function') {
+      const onAbort = () => { resolveTicket(id, 'cancelled') }
+      signal.addEventListener('abort', onAbort, { once: true })
+      promise.then(() => { try { signal.removeEventListener('abort', onAbort) } catch {} })
+    }
+    return { info, promise }
+  }
+
+  function resolveTicket(id, outcome) {
+    const t = parked.get(id)
+    if (!t) return false
+    parked.delete(id)
+    t.resolve(outcome)
+    return true
+  }
+
+  function pendingApprovals(sessionId) {
+    const out = []
+    for (const { info } of parked.values()) {
+      if (sessionId && info.sessionId && info.sessionId !== sessionId) continue
+      out.push({ ...info, ageMs: Date.now() - info.at })
+    }
+    return out
+  }
+
+  ctx.on('approval/request', function (request, next) {
+    try {
+      if (!APPROVALS_ENABLED) return next()
+      if (!request || typeof request.toolName !== 'string') return next()
+      /* 笔端最近没动静 → 维持原样，只让浏览器 UI 处理 */
+      if (Date.now() - lastPenSeen > PEN_ACTIVE_MS) return next()
+      const ticket = parkApproval(request)
+      ctx.logger?.info?.(`[pen-gateway] 审批请求 ${ticket.info.toolName}（${ticket.info.id}）转给笔端`)
+      return new Promise((resolve) => {
+        let done = false
+        const finish = (o) => {
+          if (done) return
+          done = true
+          parked.delete(ticket.info.id)
+          resolve(o)
+        }
+        ticket.promise.then((o) => { if (o) finish(o) })
+        setTimeout(() => {
+          if (done) return
+          Promise.resolve().then(next).then(finish, () => finish('unavailable'))
+        }, 1500)
+      })
+    } catch (e) {
+      ctx.logger?.warn?.(`[pen-gateway] 审批拦截失败：${e instanceof Error ? e.message : String(e)}`)
+      return next()
+    }
+  }, { prepend: true, global: true })
+
+  /* ============================ 权限管理（预设 + 策略） ============================ */
+
+  function liveSessionOf(sessionId) {
+    const sessions = safeGet('sessions')
+    const viaSessions = sessions && typeof sessions.get === 'function' ? sessions.get(sessionId) : undefined
+    if (viaSessions) return viaSessions
+    const agents = safeGet('agents')
+    const agent = agents && typeof agents.get === 'function' ? agents.get(sessionId) : undefined
+    return agent?.session
+  }
+
+  function permOf(sessionId) {
+    const presets = safeGet('permissionPresets')
+    let catalog = { options: [] }
+    try { catalog = presets?.catalog?.() ?? catalog } catch {}
+    const options = Array.isArray(catalog?.options) ? catalog.options : []
+    const session = liveSessionOf(sessionId)
+    let state = null
+    let preset = null
+    try {
+      if (session && presets) {
+        state = presets.permissionState(session)
+        preset = presets.current(session)
+      }
+    } catch {}
+    return {
+      live: !!session,
+      preset,
+      presetName: (options.find((o) => o.value === preset)?.name) ?? (preset === 'custom' ? '自定义' : null),
+      sandbox: state?.sandbox ?? null,
+      approval: state?.approval ?? null,
+      presets: options.map((o) => ({
+        value: String(o.value),
+        name: String(o.name ?? o.value),
+        description: o.description ? String(o.description) : '',
+      })),
+    }
+  }
+
+  function setPreset(sessionId, name) {
+    const presets = safeGet('permissionPresets')
+    const session = liveSessionOf(sessionId)
+    if (!presets || typeof presets.set !== 'function') throw new Error('permission/unavailable: 宿主没有 permissionPresets 服务')
+    if (!session) throw new Error('permission/session-idle: 会话未激活，先在笔端发一条消息再改权限')
+    presets.set(session, name)
+    return permOf(sessionId)
+  }
+
   /* ============================ /api/pen 路由 ============================
    * GET/POST 双支持：笔端原生 http 的 POST body 能力未验证，全走 GET + query；
    * 桌面侧调试可用 POST JSON。 */
   async function handle(req, res, path, q, body) {
     body = body ?? {}
+    lastPenSeen = Date.now()
     if (path === '/health') {
       return sendJson(res, 200, { ok: true, plugin: 'pen-gateway', version: PLUGIN_VERSION })
     }
@@ -532,6 +668,7 @@ export function apply(ctx, config) {
       const t0 = Date.now()
       let changed = false
       while (Date.now() - t0 < waitMs) {
+        if (pendingApprovals(sessionId).length) { changed = true; break }
         try {
           const items = await listSessions(true)
           const me = items.find((it) => it.sessionId === sessionId)
@@ -544,7 +681,7 @@ export function apply(ctx, config) {
         const t = await foldHistory(sessionId, 6, { wantMeta: true })
         const items2 = await listSessions()
         const me2 = items2.find((it) => it.sessionId === sessionId)
-        return sendJson(res, 200, { ok: true, changed, updatedAt: me2?.updatedAt ?? 0, ...t, waitedMs: Date.now() - t0 })
+        return sendJson(res, 200, { ok: true, changed, updatedAt: me2?.updatedAt ?? 0, ...t, approvals: pendingApprovals(sessionId), waitedMs: Date.now() - t0 })
       } catch (e) {
         return sendJson(res, 200, { ok: false, error: String(e?.message ?? e) })
       }
@@ -553,7 +690,33 @@ export function apply(ctx, config) {
       const sessionId = String(q.get('sessionId') ?? body.sessionId ?? '')
       if (!sessionId) return sendJson(res, 200, { ok: false, error: 'sessionId required' })
       const n = parseInt(q.get('n') ?? body.n ?? '6', 10) || 6
-      return sendJson(res, 200, { ok: true, ...(await foldHistory(sessionId, n, { wantMeta: true })) })
+      return sendJson(res, 200, { ok: true, ...(await foldHistory(sessionId, n, { wantMeta: true })), approvals: pendingApprovals(sessionId) })
+    }
+    if (path === '/approvals') {
+      const sessionId = String(q.get('sessionId') ?? body.sessionId ?? '')
+      return sendJson(res, 200, { ok: true, approvals: pendingApprovals(sessionId) })
+    }
+    if (path === '/approve') {
+      const id = String(q.get('id') ?? body.id ?? '')
+      const allow = String(q.get('allow') ?? body.allow ?? '1') !== '0'
+      if (!id) return sendJson(res, 200, { ok: false, error: 'id required' })
+      const outcome = allow ? 'allowed-once' : 'rejected'
+      const done = resolveTicket(id, outcome)
+      ctx.logger?.info?.(`[pen-gateway] 笔端审批 ${id} → ${outcome}${done ? '' : '（已失效）'}`)
+      return sendJson(res, 200, { ok: true, decided: done, outcome })
+    }
+    if (path === '/perm') {
+      const sessionId = String(q.get('sessionId') ?? body.sessionId ?? '')
+      const want = String(q.get('preset') ?? body.preset ?? '')
+      if (!sessionId) return sendJson(res, 200, { ok: false, error: 'sessionId required' })
+      if (want) {
+        try {
+          return sendJson(res, 200, { ok: true, ...setPreset(sessionId, want) })
+        } catch (e) {
+          return sendJson(res, 200, { ok: false, error: String(e?.message ?? e), ...permOf(sessionId) })
+        }
+      }
+      return sendJson(res, 200, { ok: true, ...permOf(sessionId) })
     }
     if (path === '/prompt') {
       const sessionId = String(q.get('sessionId') ?? body.sessionId ?? '')
